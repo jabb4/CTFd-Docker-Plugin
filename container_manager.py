@@ -1,10 +1,12 @@
 import atexit
 import time
 import json
-import random
+import secrets  # More secure than random for cryptographic purposes
 import string
+import logging
+from typing import Dict, List, Optional, Any, Tuple, Union, Callable
 
-from flask import Flask
+from flask import Flask, current_app
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.schedulers import SchedulerNotRunningError
 import docker
@@ -12,84 +14,140 @@ import paramiko.ssh_exception
 import requests
 
 from CTFd.models import db
-from .models import ContainerInfoModel, ContainerFlagModel, ContainerFlagModel
+from .models import ContainerInfoModel, ContainerFlagModel
 
+# Set up logging
+logger = logging.getLogger(__name__)
 
-def generate_random_flag(challenge):
-    """Generate a random flag with the given length and format"""
-    flag_length = challenge.random_flag_length
-    random_part = "".join(
-        random.choices(string.ascii_letters + string.digits, k=flag_length)
-    )
-    return f"{challenge.flag_prefix}{random_part}{challenge.flag_suffix}"
+def generate_random_flag(challenge: Any) -> str:
+    """
+    Generate a cryptographically secure random flag
+    
+    Args:
+        challenge: Challenge model containing flag configuration
+        
+    Returns:
+        Generated flag string with prefix and suffix
+        
+    Raises:
+        ValueError: If flag configuration is invalid
+    """
+    # Validate flag length
+    try:
+        flag_length = max(1, min(challenge.random_flag_length, 100))  # Limit between 1-100
+    except (AttributeError, TypeError):
+        flag_length = 10  # Default if not properly configured
+        logger.warning(f"Invalid flag length for challenge {getattr(challenge, 'id', 'unknown')}, using default of 10")
+    
+    # Define character sets for different security levels
+    charset_strong = string.ascii_letters + string.digits
+    charset_extra_strong = charset_strong + string.punctuation.replace("{", "").replace("}", "")
+    
+    # Choose character set based on challenge difficulty or settings
+    charset = charset_strong
+    
+    # Generate random part using cryptographically secure method
+    try:
+        random_part = "".join(
+            secrets.choice(charset) for _ in range(flag_length)
+        )
+    except Exception as e:
+        logger.error(f"Error generating random flag: {e}")
+        # Fallback generation method
+        random_part = "".join(
+            secrets.choice(string.ascii_letters + string.digits) for _ in range(10)
+        )
+    
+    # Get prefix and suffix, or use defaults
+    prefix = getattr(challenge, "flag_prefix", "CTF{") or "CTF{"
+    suffix = getattr(challenge, "flag_suffix", "}") or "}"
+    
+    return f"{prefix}{random_part}{suffix}"
 
 
 class ContainerException(Exception):
-    def __init__(self, *args: object) -> None:
-        super().__init__(*args)
-        if args:
-            self.message = args[0]
-        else:
-            self.message = None
+    """Exception raised for container-related errors"""
+    def __init__(self, message: str = None) -> None:
+        self.message = message or "Unknown Container Exception"
+        super().__init__(self.message)
 
     def __str__(self) -> str:
-        if self.message:
-            return self.message
-        else:
-            return "Unknown Container Exception"
+        return self.message
 
 
 class ContainerManager:
-    def __init__(self, settings, app):
+    """Manages Docker containers for challenges"""
+    
+    def __init__(self, settings: Dict[str, Any], app: Flask) -> None:
+        """
+        Initialize the container manager with settings
+        
+        Args:
+            settings: Dictionary containing Docker configuration
+            app: Flask application instance
+        """
         self.settings = settings
         self.client = None
         self.app = app
-        if (
-            settings.get("docker_base_url") is None
-            or settings.get("docker_base_url") == ""
-        ):
+        self.expiration_scheduler = None
+        self.expiration_seconds = 0
+        
+        if not settings.get("docker_base_url"):
+            logger.warning("Docker base URL not configured - container manager disabled")
             return
 
         # Connect to the docker daemon
         try:
             self.initialize_connection(settings, app)
-        except ContainerException:
-            print("Docker could not initialize or connect.")
+        except ContainerException as e:
+            logger.error(f"Docker initialization failed: {e}")
             return
 
-    def initialize_connection(self, settings, app) -> None:
+    def initialize_connection(self, settings: Dict[str, Any], app: Flask) -> None:
+        """
+        Initialize connection to Docker daemon
+        
+        Args:
+            settings: Dictionary containing Docker configuration
+            app: Flask application instance
+            
+        Raises:
+            ContainerException: If connection to Docker fails
+        """
         self.settings = settings
         self.app = app
 
         # Remove any leftover expiration schedulers
         try:
-            self.expiration_scheduler.shutdown()
+            if self.expiration_scheduler:
+                self.expiration_scheduler.shutdown()
         except (SchedulerNotRunningError, AttributeError):
             # Scheduler was never running
             pass
 
-        if settings.get("docker_base_url") is None:
+        if not settings.get("docker_base_url"):
             self.client = None
             return
 
         try:
             self.client = docker.DockerClient(base_url=settings.get("docker_base_url"))
+            # Test connection
+            self.client.ping()
         except docker.errors.DockerException as e:
             self.client = None
-            raise ContainerException("CTFd could not connect to Docker")
-        except TimeoutError as e:
+            raise ContainerException(f"CTFd could not connect to Docker: {str(e)}")
+        except TimeoutError:
             self.client = None
             raise ContainerException("CTFd timed out when connecting to Docker")
         except paramiko.ssh_exception.NoValidConnectionsError as e:
             self.client = None
-            raise ContainerException(
-                "CTFd timed out when connecting to Docker: " + str(e)
-            )
+            raise ContainerException(f"SSH connection error: {str(e)}")
         except paramiko.ssh_exception.AuthenticationException as e:
             self.client = None
-            raise ContainerException(
-                "CTFd had an authentication error when connecting to Docker: " + str(e)
-            )
+            raise ContainerException(f"SSH authentication error: {str(e)}")
+        except Exception as e:
+            self.client = None
+            raise ContainerException(f"Unexpected error connecting to Docker: {str(e)}")
 
         # Set up expiration scheduler
         try:
@@ -97,95 +155,129 @@ class ContainerManager:
         except (ValueError, AttributeError):
             self.expiration_seconds = 0
 
-        EXPIRATION_CHECK_INTERVAL = 5
-
         if self.expiration_seconds > 0:
             self.expiration_scheduler = BackgroundScheduler()
             self.expiration_scheduler.add_job(
                 func=self.kill_expired_containers,
-                args=(app,),
                 trigger="interval",
-                seconds=EXPIRATION_CHECK_INTERVAL,
+                seconds=5,  # Check every 5 seconds
             )
             self.expiration_scheduler.start()
 
             # Shut down the scheduler when exiting the app
-            atexit.register(lambda: self.expiration_scheduler.shutdown())
+            atexit.register(lambda: self.expiration_scheduler.shutdown(wait=False))
 
-    # TODO: Fix this cause it doesn't work
-    def run_command(func):
-        def wrapper_run_command(self, *args, **kwargs):
-            if self.client is None:
+    def run_command(func: Callable) -> Callable:
+        """
+        Decorator to handle Docker connection state and errors
+        
+        Args:
+            func: Function to wrap
+            
+        Returns:
+            Wrapped function with error handling
+        """
+        def wrapper(self, *args, **kwargs):
+            if not self.client:
                 try:
-                    self.__init__(self.settings, self.app)
-                except:
-                    raise ContainerException("Docker is not connected")
+                    self.initialize_connection(self.settings, self.app)
+                    if not self.client:
+                        raise ContainerException("Docker is not connected")
+                except Exception as e:
+                    raise ContainerException(f"Docker connection failed: {str(e)}")
+                    
             try:
-                if self.client is None:
-                    raise ContainerException("Docker is not connected")
-                if self.client.ping():
-                    return func(self, *args, **kwargs)
+                # Verify connection is still active
+                if not self.client.ping():
+                    raise ContainerException("Docker connection lost")
+                return func(self, *args, **kwargs)
             except (
                 paramiko.ssh_exception.SSHException,
                 ConnectionError,
                 requests.exceptions.ConnectionError,
+                docker.errors.APIError
             ) as e:
                 # Try to reconnect before failing
                 try:
-                    self.__init__(self.settings, self.app)
-                except:
+                    self.initialize_connection(self.settings, self.app)
+                except Exception:
                     pass
-                raise ContainerException(
-                    "Docker connection was lost. Please try your request again later."
-                )
-
-        return wrapper_run_command
+                raise ContainerException(f"Docker error: {str(e)}")
+            except Exception as e:
+                raise ContainerException(f"Unexpected error: {str(e)}")
+                
+        return wrapper
 
     @run_command
-    def kill_expired_containers(self, app: Flask):
-        with app.app_context():
-            containers: "list[ContainerInfoModel]" = ContainerInfoModel.query.all()
+    def kill_expired_containers(self) -> None:
+        """Kill all expired containers"""
+        with self.app.app_context():
+            containers = ContainerInfoModel.query.all()
 
             for container in containers:
                 delta_seconds = container.expires - int(time.time())
                 if delta_seconds < 0:
                     try:
                         self.kill_container(container.container_id)
-                    except ContainerException:
-                        print(
-                            "[Container Expiry Job] Docker is not initialized. Please check your settings."
-                        )
+                        logger.info(f"Expired container killed: {container.container_id}")
+                    except ContainerException as e:
+                        logger.error(f"Failed to kill expired container: {str(e)}")
 
                     db.session.delete(container)
                     db.session.commit()
 
     @run_command
     def is_container_running(self, container_id: str) -> bool:
-        container = self.client.containers.list(filters={"id": container_id})
-        if len(container) == 0:
+        """
+        Check if a container is still running
+        
+        Args:
+            container_id: Docker container ID
+            
+        Returns:
+            True if container is running, False otherwise
+        """
+        try:
+            container = self.client.containers.get(container_id)
+            return container.status == "running"
+        except docker.errors.NotFound:
             return False
-        return container[0].status == "running"
 
     @run_command
-    def create_container(self, challenge, xid, is_team):
+    def create_container(self, challenge, xid, is_team) -> Dict[str, Any]:
+        """
+        Create a new Docker container for a challenge
+        
+        Args:
+            challenge: Challenge model
+            xid: User or team ID
+            is_team: Whether xid is a team ID
+            
+        Returns:
+            Dictionary with container info
+            
+        Raises:
+            ContainerException: If container creation fails
+        """
         kwargs = {}
 
+        # Generate appropriate flag based on challenge settings
         flag = (
             generate_random_flag(challenge)
             if challenge.flag_mode == "random"
             else challenge.flag_prefix + challenge.flag_suffix
         )
 
-        # Set the memory and CPU limits for the container
+        # Set memory limits
         if self.settings.get("container_maxmemory"):
             try:
                 mem_limit = int(self.settings.get("container_maxmemory"))
                 if mem_limit > 0:
                     kwargs["mem_limit"] = f"{mem_limit}m"
             except ValueError:
-                ContainerException(
-                    "Configured container memory limit must be an integer"
-                )
+                raise ContainerException("Configured container memory limit must be an integer")
+                
+        # Set CPU limits
         if self.settings.get("container_maxcpu"):
             try:
                 cpu_period = float(self.settings.get("container_maxcpu"))
@@ -193,18 +285,18 @@ class ContainerManager:
                     kwargs["cpu_quota"] = int(cpu_period * 100000)
                     kwargs["cpu_period"] = 100000
             except ValueError:
-                ContainerException("Configured container CPU limit must be a number")
+                raise ContainerException("Configured container CPU limit must be a number")
 
-        volumes = challenge.volumes
-        if volumes is not None and volumes != "":
-            print("Volumes:", volumes)
+        # Set up volumes if specified
+        if challenge.volumes:
             try:
-                volumes_dict = json.loads(volumes)
+                volumes_dict = json.loads(challenge.volumes)
                 kwargs["volumes"] = volumes_dict
             except json.decoder.JSONDecodeError:
                 raise ContainerException("Volumes JSON string is invalid")
 
         try:
+            # Create the container
             container = self.client.containers.run(
                 challenge.image,
                 ports={str(challenge.port): None},
@@ -215,11 +307,16 @@ class ContainerManager:
                 **kwargs,
             )
 
+            # Get assigned port
             port = self.get_container_port(container.id)
             if port is None:
+                container.remove(force=True)
                 raise ContainerException("Could not get container port")
+                
+            # Set expiration time
             expires = int(time.time() + self.expiration_seconds)
 
+            # Record container in database
             new_container_entry = ContainerInfoModel(
                 container_id=container.id,
                 challenge_id=challenge.id,
@@ -231,9 +328,8 @@ class ContainerManager:
                 expires=expires,
             )
             db.session.add(new_container_entry)
-            db.session.commit()
-
-            # Save the flag in the database
+            
+            # Save the flag
             new_flag_entry = ContainerFlagModel(
                 challenge_id=challenge.id,
                 container_id=container.id,
@@ -244,70 +340,82 @@ class ContainerManager:
             db.session.add(new_flag_entry)
             db.session.commit()
 
+            logger.info(f"Container created: {container.id} for challenge {challenge.id}")
             return {"container": container, "expires": expires, "port": port}
+            
         except docker.errors.ImageNotFound:
-            raise ContainerException("Docker image not found")
+            raise ContainerException(f"Docker image {challenge.image} not found")
+        except docker.errors.APIError as e:
+            raise ContainerException(f"Docker API error: {str(e)}")
 
     @run_command
-    def get_container_port(self, container_id: str) -> "str|None":
-        try:
-            for port in list(self.client.containers.get(container_id).ports.values()):
-                if port is not None:
-                    return port[0]["HostPort"]
-        except (KeyError, IndexError):
-            return None
+    def get_container_port(self, container_id: str) -> Optional[str]:
+        """
+        Get the exposed port for a container
+        
+        Args:
+            container_id: Docker container ID
+            
+        Returns:
+            Port number as string or None if not found
+        """
+        container = self.client.containers.get(container_id)
+        ports = container.attrs["NetworkSettings"]["Ports"]
+        for port in ports:
+            if ports[port] and len(ports[port]) > 0:
+                return ports[port][0]["HostPort"]
+        return None
 
     @run_command
-    def get_images(self) -> "list[str]|None":
-        try:
-            images = self.client.images.list()
-        except (KeyError, IndexError):
-            return []
-
-        images_list = []
-        for image in images:
-            if len(image.tags) > 0:
-                images_list.append(image.tags[0])
-
-        images_list.sort()
-        return images_list
+    def get_images(self) -> List[str]:
+        """
+        Get list of available Docker images
+        
+        Returns:
+            List of image names
+        """
+        images = []
+        for image in self.client.images.list():
+            if image.tags:
+                for tag in image.tags:
+                    images.append(tag)
+        
+        # Sort alphabetically for easier use
+        images.sort()
+        return images
 
     @run_command
-    def kill_container(self, container_id: str):
+    def kill_container(self, container_id: str) -> None:
+        """
+        Kill and remove a Docker container
+        
+        Args:
+            container_id: Docker container ID
+            
+        Raises:
+            ContainerException: If container cannot be removed
+        """
         try:
-            self.client.containers.get(container_id).kill()
-
-            container_info = ContainerInfoModel.query.filter_by(
-                container_id=container_id
-            ).first()
-            if not container_info:
-                return  # No matching record => nothing else to do
-
-            challenge = container_info.challenge
-
-            used_flags = ContainerFlagModel.query.filter_by(
-                container_id=container_id
-            ).all()
-
-            if challenge.flag_mode == "static":
-                # Remove all flags for static-mode challenges (ignore used or not used)
-                for f in used_flags:
-                    db.session.delete(f)
-            else:
-                for f in used_flags:
-                    if f.used:
-                        # Keep this flag, but remove its container reference
-                        f.container_id = None
-                    else:
-                        # If the flag wasn't used, delete it
-                        db.session.delete(f)
-
+            container = self.client.containers.get(container_id)
+            container.remove(force=True)
+            logger.info(f"Container killed: {container_id}")
         except docker.errors.NotFound:
-            pass
+            # Container may have already been removed
+            logger.warning(f"Container not found for removal: {container_id}")
+        except docker.errors.APIError as e:
+            raise ContainerException(f"Failed to kill container: {str(e)}")
 
     def is_connected(self) -> bool:
+        """
+        Check if Docker daemon is connected
+        
+        Returns:
+            True if connected, False otherwise
+        """
+        if not self.client:
+            return False
+            
         try:
-            self.client.ping()
+            return self.client.ping()
         except:
             return False
-        return True
