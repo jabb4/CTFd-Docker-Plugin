@@ -86,22 +86,54 @@ class ContainerManager:
             settings: Dictionary containing Docker configuration
             app: Flask application instance
         """
-        self.settings = settings
+        self.settings = self.validate_settings(settings)
         self.client = None
         self.app = app
         self.expiration_scheduler = None
         self.expiration_seconds = 0
         
-        if not settings.get("docker_base_url"):
+        if not self.settings.get("docker_base_url"):
             logger.warning("Docker base URL not configured - container manager disabled")
             return
 
         # Connect to the docker daemon
         try:
-            self.initialize_connection(settings, app)
+            self.initialize_connection(self.settings, app)
         except ContainerException as e:
             logger.error(f"Docker initialization failed: {e}")
             return
+
+    def validate_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Validate and normalize Docker settings
+        
+        Args:
+            settings: Raw settings dictionary
+            
+        Returns:
+            Validated and normalized settings dictionary
+        """
+        # Create a copy to avoid modifying the original
+        validated = settings.copy() if settings else {}
+        
+        # Ensure docker_hostname exists and is not empty
+        if not validated.get("docker_hostname"):
+            # Try to determine hostname from docker_base_url if possible
+            if validated.get("docker_base_url"):
+                url = validated["docker_base_url"]
+                if url.startswith("tcp://"):
+                    # Extract hostname from TCP URL
+                    host_part = url.replace("tcp://", "").split(":")[0]
+                    if host_part and host_part not in ("localhost", "127.0.0.1"):
+                        validated["docker_hostname"] = host_part
+                        logger.info(f"Automatically set docker_hostname to {host_part} from docker_base_url")
+            
+            # If still not set, use a default
+            if not validated.get("docker_hostname"):
+                validated["docker_hostname"] = "localhost"
+                logger.warning("docker_hostname not set, using 'localhost' as default")
+                
+        return validated
 
     def initialize_connection(self, settings: Dict[str, Any], app: Flask) -> None:
         """
@@ -310,8 +342,19 @@ class ContainerManager:
             # Get assigned port
             port = self.get_container_port(container.id)
             if port is None:
-                container.remove(force=True)
+                logger.error(f"Could not get port for container {container.id}")
+                try:
+                    container.remove(force=True)
+                except Exception as e:
+                    logger.error(f"Failed to remove container after port assignment failure: {e}")
                 raise ContainerException("Could not get container port")
+                
+            # Convert port to integer for consistency
+            try:
+                port_int = int(port)
+            except (ValueError, TypeError):
+                logger.warning(f"Port {port} is not a valid integer, using as string")
+                port_int = 0
                 
             # Set expiration time
             expires = int(time.time() + self.expiration_seconds)
@@ -322,7 +365,7 @@ class ContainerManager:
                 challenge_id=challenge.id,
                 team_id=xid if is_team else None,
                 user_id=None if is_team else xid,
-                port=port,
+                port=port_int or port,  # Use int if possible, otherwise use string
                 flag=flag,
                 timestamp=int(time.time()),
                 expires=expires,
@@ -341,7 +384,13 @@ class ContainerManager:
             db.session.commit()
 
             logger.info(f"Container created: {container.id} for challenge {challenge.id}")
-            return {"container": container, "expires": expires, "port": port}
+            
+            # Return a clean dictionary with validated port and expires
+            return {
+                "container": container.id,
+                "port": port_int or port,
+                "expires": expires,
+            }
             
         except docker.errors.ImageNotFound:
             raise ContainerException(f"Docker image {challenge.image} not found")

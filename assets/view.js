@@ -65,28 +65,65 @@ function toggleChallengeUpdate() {
     document.getElementById("terminate-chal").classList.toggle('d-none');
 }
 
-function calculateExpiry(date) {
-    return Math.ceil((new Date(date * 1000) - new Date()) / 1000 / 60);
+function calculateExpiry(timestamp) {
+    if (!timestamp) return 'Unknown';
+    
+    // Convert timestamp to milliseconds if it's in seconds
+    const timestampMs = timestamp * 1000;
+    const expiryDate = new Date(timestampMs);
+    const now = new Date();
+    
+    // Calculate the difference in minutes
+    const diffMs = expiryDate - now;
+    if (diffMs <= 0) return 'Expired';
+    
+    const diffMinutes = Math.ceil(diffMs / 1000 / 60);
+    return diffMinutes;
 }
 
 function createChallengeLinkElement(data, parent) {
     parent.innerHTML = "";
+    
+    // Enable debugging to see what data is actually received
+    console.log("Container data received:", data);
+    
+    // Check if all required data is present
+    if (!data) {
+        parent.innerHTML = "No container data received. Please try again.";
+        parent.classList.add("alert-danger");
+        return;
+    }
+    
+    // Use default values for missing fields to avoid undefined errors
+    const hostname = data.hostname || "localhost";
+    const port = data.port || "N/A";
+    const expires = data.expires || 0;
+    const connectionType = data.connect || "http";
+    
+    // Calculate expiry time
+    const expiryMinutes = calculateExpiry(expires);
+    
+    // Show expires information
+    let expiresElement = document.createElement('span');
+    expiresElement.textContent = "Expires in " + expiryMinutes + " minutes.";
+    parent.append(expiresElement, document.createElement('br'));
 
-    let expires = document.createElement('span');
-    expires.textContent = "Expires in " + calculateExpiry(new Date(data.expires)) + " minutes.";
-    parent.append(expires, document.createElement('br'));
-
-    if (data.connect == "tcp") {
+    // Create connection information based on connection type
+    if (connectionType === "tcp") {
         let codeElement = document.createElement('code');
-        codeElement.textContent = 'nc ' + data.hostname + " " + data.port;
+        codeElement.textContent = 'nc ' + hostname + " " + port;
         parent.append(codeElement);
     } else {
         let link = document.createElement('a');
-        link.href = 'http://' + data.hostname + ":" + data.port;
-        link.textContent = 'http://' + data.hostname + ":" + data.port;
+        link.href = 'http://' + hostname + ":" + port;
+        link.textContent = 'http://' + hostname + ":" + port;
         link.target = '_blank';
         parent.append(link);
     }
+    
+    // Make sure parent has the right styling
+    parent.classList.remove("alert-danger");
+    parent.classList.add("alert-primary");
 }
 
 function view_container_info(challenge_id) {
@@ -104,22 +141,46 @@ function view_container_info(challenge_id) {
     .then(response => response.json())
     .then(data => {
         alert.innerHTML = ""; // Remove spinner
-        if (data.status == "Challenge not started") {
-            alert.innerHTML = data.status;
-            toggleChallengeCreate();
-        } else if (data.status == "already_running") {
-            createChallengeLinkElement(data, alert);
-            toggleChallengeUpdate();
-        } else {
-            alert.innerHTML = data.message;
+        
+        if (data.error) {
+            alert.innerHTML = data.error;
             alert.classList.add("alert-danger");
-            toggleChallengeUpdate();
+            document.getElementById("create-chal").classList.remove("d-none");
+            document.getElementById("extend-chal").classList.add("d-none");
+            document.getElementById("terminate-chal").classList.add("d-none");
+            return;
+        }
+        
+        if (data.status === "not_started" || data.status === "Challenge not started") {
+            alert.innerHTML = "No active instance. Click 'Fetch Instance' to start a new container.";
+            document.getElementById("create-chal").classList.remove("d-none");
+            document.getElementById("extend-chal").classList.add("d-none");
+            document.getElementById("terminate-chal").classList.add("d-none");
+        } else if (data.status === "already_running") {
+            createChallengeLinkElement(data, alert);
+            document.getElementById("create-chal").classList.add("d-none");
+            document.getElementById("extend-chal").classList.remove("d-none");
+            document.getElementById("terminate-chal").classList.remove("d-none");
+        } else if (data.status === "not_running") {
+            alert.innerHTML = "Your instance has stopped. Click 'Fetch Instance' to start a new container.";
+            document.getElementById("create-chal").classList.remove("d-none");
+            document.getElementById("extend-chal").classList.add("d-none");
+            document.getElementById("terminate-chal").classList.add("d-none");
+        } else {
+            // Fall back for any other status
+            alert.innerHTML = data.status || "Unknown status";
+            alert.classList.add("alert-info");
+            document.getElementById("create-chal").classList.remove("d-none");
+            document.getElementById("extend-chal").classList.add("d-none");
+            document.getElementById("terminate-chal").classList.add("d-none");
         }
     })
     .catch(error => {
         alert.innerHTML = "Error fetching container info.";
         alert.classList.add("alert-danger");
         console.error("Fetch error:", error);
+        // In case of error, show the create button
+        document.getElementById("create-chal").classList.remove("d-none");
     })
     .finally(enableButtons);
 }
@@ -139,24 +200,33 @@ function container_request(challenge_id) {
     .then(response => response.json())
     .then(data => {
         alert.innerHTML = ""; // Remove spinner
+        
         if (data.error) {
             alert.innerHTML = data.error;
             alert.classList.add("alert-danger");
-            toggleChallengeCreate();
-        } else if (data.message) {
-            alert.innerHTML = data.message;
-            alert.classList.add("alert-danger");
-            toggleChallengeCreate();
-        } else {
+            document.getElementById("create-chal").classList.remove("d-none");
+            document.getElementById("extend-chal").classList.add("d-none");
+            document.getElementById("terminate-chal").classList.add("d-none");
+            return;
+        }
+        
+        if (data.status === "created" || data.status === "already_running") {
             createChallengeLinkElement(data, alert);
-            toggleChallengeUpdate();
-            toggleChallengeCreate();
+            document.getElementById("create-chal").classList.add("d-none");
+            document.getElementById("extend-chal").classList.remove("d-none");
+            document.getElementById("terminate-chal").classList.remove("d-none");
+        } else {
+            // Handle any other status
+            alert.innerHTML = data.message || data.status || "Unknown response";
+            alert.classList.add("alert-info");
+            document.getElementById("create-chal").classList.remove("d-none");
         }
     })
     .catch(error => {
         alert.innerHTML = "Error requesting container.";
         alert.classList.add("alert-danger");
         console.error("Fetch error:", error);
+        document.getElementById("create-chal").classList.remove("d-none");
     })
     .finally(enableButtons);
 }
@@ -176,13 +246,22 @@ function container_renew(challenge_id) {
     .then(response => response.json())
     .then(data => {
         alert.innerHTML = ""; // Remove spinner
+        
         if (data.error) {
             alert.innerHTML = data.error;
             alert.classList.add("alert-danger");
+            return;
+        }
+        
+        if (data.success) {
+            // If the renew was successful, display connection details
+            createChallengeLinkElement(data, alert);
         } else if (data.message) {
+            // Display any other messages
             alert.innerHTML = data.message;
-            alert.classList.add("alert-danger");
+            alert.classList.add("alert-info");
         } else {
+            // Fallback message
             createChallengeLinkElement(data, alert);
         }
     })
@@ -209,18 +288,20 @@ function container_stop(challenge_id) {
     .then(response => response.json())
     .then(data => {
         alert.innerHTML = ""; // Remove spinner
+        
         if (data.error) {
             alert.innerHTML = data.error;
             alert.classList.add("alert-danger");
-            toggleChallengeCreate();
-        } else if (data.message) {
-            alert.innerHTML = data.message;
-            alert.classList.add("alert-danger");
-            toggleChallengeCreate();
+        } else if (data.success) {
+            alert.innerHTML = "Container terminated successfully.";
+            // Show create button, hide extend and terminate
+            document.getElementById("create-chal").classList.remove("d-none");
+            document.getElementById("extend-chal").classList.add("d-none");
+            document.getElementById("terminate-chal").classList.add("d-none");
         } else {
-            alert.innerHTML = "Challenge Terminated.";
-            toggleChallengeCreate();
-            toggleChallengeUpdate();
+            // Handle any unexpected response
+            alert.innerHTML = data.message || "Unknown response.";
+            alert.classList.add("alert-warning");
         }
     })
     .catch(error => {

@@ -141,12 +141,22 @@ def renew_container(container_manager: ContainerManager, chal_id: int, xid: int,
         
         logger.info(f"Container {running_container.container_id} renewed until {running_container.expires}")
         
+        # Get hostname with fallback
+        hostname = container_manager.settings.get("docker_hostname", "localhost")
+        
+        # Ensure port is valid
+        port = running_container.port
+        if not port:
+            logger.warning(f"Container {running_container.container_id} has no port")
+            port = 0
+        
         return jsonify({
             "success": "Container renewed",
+            "status": "already_running",
+            "hostname": hostname,
+            "port": port,
+            "connect": challenge.connection_type or "http",
             "expires": running_container.expires,
-            "hostname": container_manager.settings.get("docker_hostname", ""),
-            "port": running_container.port,
-            "connect": challenge.connection_type,
         })
     except ContainerException as e:
         logger.error(f"Error renewing container: {e}")
@@ -207,9 +217,10 @@ def create_container(container_manager: ContainerManager, chal_id: int, xid: int
     if running_container:
         try:
             if container_manager.is_container_running(running_container.container_id):
+                hostname = container_manager.settings.get("docker_hostname", "localhost")
                 return jsonify({
                     "status": "already_running",
-                    "hostname": container_manager.settings.get("docker_hostname", ""),
+                    "hostname": hostname,
                     "port": running_container.port,
                     "connect": challenge.connection_type,
                     "expires": running_container.expires,
@@ -228,12 +239,26 @@ def create_container(container_manager: ContainerManager, chal_id: int, xid: int
         created_container = container_manager.create_container(challenge, xid, is_team)
         logger.info(f"Created new container for challenge {chal_id}, user/team {xid}")
         
+        hostname = container_manager.settings.get("docker_hostname", "localhost")
+        port = created_container.get("port")
+        expires = created_container.get("expires")
+        
+        # Validate critical fields
+        if not port:
+            logger.error(f"No port assigned to created container for challenge {chal_id}")
+            return jsonify({"error": "Failed to assign port to container"}), 500
+            
+        if not expires:
+            # Use default expiration if not provided
+            expires = int(time.time() + 3600)  # 1 hour default
+            logger.warning(f"No expiration provided for container, using default")
+        
         return jsonify({
             "status": "created",
-            "hostname": container_manager.settings.get("docker_hostname", ""),
-            "port": created_container["port"],
+            "hostname": hostname,
+            "port": port,
             "connect": challenge.connection_type,
-            "expires": created_container["expires"],
+            "expires": expires,
         })
     except ContainerException as e:
         logger.error(f"Failed to create container: {e}")
@@ -267,24 +292,49 @@ def view_container_info(container_manager: ContainerManager, chal_id: int, xid: 
     if running_container:
         try:
             if container_manager.is_container_running(running_container.container_id):
+                hostname = container_manager.settings.get("docker_hostname", "localhost")
+                
+                # Check for missing data and set defaults
+                port = running_container.port 
+                if not port:
+                    logger.warning(f"Container {running_container.container_id} has no port")
+                    port = 0
+                
+                expires = running_container.expires
+                if not expires:
+                    expires = int(time.time() + 3600)  # Default 1 hour
+                    logger.warning(f"Container {running_container.container_id} has no expiry time")
+                    
                 return jsonify({
                     "status": "already_running",
-                    "hostname": container_manager.settings.get("docker_hostname", ""),
-                    "port": running_container.port,
-                    "connect": challenge.connection_type,
-                    "expires": running_container.expires,
+                    "hostname": hostname,
+                    "port": port,
+                    "connect": challenge.connection_type or "http",
+                    "expires": expires,
                 })
             else:
                 # Container exists in DB but not running anymore - clean up
                 logger.info(f"Found stale container {running_container.container_id} - cleaning up")
                 db.session.delete(running_container)
                 db.session.commit()
-                return jsonify({"status": "not_running"})
+                return jsonify({
+                    "status": "not_running",
+                    "hostname": container_manager.settings.get("docker_hostname", "localhost"),
+                    "port": 0,
+                    "connect": challenge.connection_type or "http",
+                    "expires": 0
+                })
         except ContainerException as e:
             logger.error(f"Error checking container status: {e}")
             return jsonify({"error": str(e)}), 500
     else:
-        return jsonify({"status": "not_started"})
+        return jsonify({
+            "status": "not_started",
+            "hostname": container_manager.settings.get("docker_hostname", "localhost"),
+            "port": 0,
+            "connect": challenge.connection_type or "http",
+            "expires": 0
+        })
 
 
 def connect_type(chal_id: int) -> Response:

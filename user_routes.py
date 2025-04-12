@@ -1,4 +1,5 @@
 import json
+import logging
 from flask import Blueprint, request, jsonify, render_template, url_for, redirect, Flask, flash
 from CTFd.models import db
 from .models import ContainerChallengeModel, ContainerInfoModel, ContainerSettingsModel
@@ -13,6 +14,9 @@ from CTFd.utils.decorators import (
 from .helpers import *
 from CTFd.utils.user import get_current_user
 from CTFd.utils import get_config
+
+# Set up logging
+logger = logging.getLogger(__name__)
 
 containers_bp = Blueprint("container_user", __name__, url_prefix="/containers")
 
@@ -81,15 +85,36 @@ def route_renew_container():
 def route_stop_container():
     try:
         validate_request(request.json, ["chal_id"])
+        chal_id = request.json.get("chal_id")
         xid = get_current_user_or_team()
+        
+        challenge = ContainerChallengeModel.query.filter_by(id=chal_id).first()
+        if not challenge:
+            return jsonify({"error": "Challenge not found"}), 400
+        
         running_container = ContainerInfoModel.query.filter_by(
-            challenge_id=request.json.get("chal_id"),
+            challenge_id=chal_id,
             team_id=xid if is_team_mode() else None,
             user_id=None if is_team_mode() else xid
         ).first()
 
         if running_container:
-            return kill_container(container_manager, running_container.container_id)
-        return {"error": "No container found"}, 400
+            result = kill_container(container_manager, running_container.container_id)
+            if isinstance(result, tuple) and len(result) > 1 and result[1] != 200:
+                # Error occurred
+                return result
+            # Add additional fields for consistent response format
+            return jsonify({
+                "success": "Container terminated successfully",
+                "status": "not_running",
+                "hostname": container_manager.settings.get("docker_hostname", "localhost"),
+                "port": 0,
+                "connect": challenge.connection_type,
+                "expires": 0
+            })
+        return jsonify({"error": "No container found"}), 400
     except ValueError as err:
-        return {"error": str(err)}, 400
+        return jsonify({"error": str(err)}), 400
+    except Exception as e:
+        logger.error(f"Error stopping container: {e}")
+        return jsonify({"error": f"Error: {str(e)}"}), 500
