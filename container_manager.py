@@ -103,7 +103,6 @@ class ContainerManager:
             self.expiration_scheduler = BackgroundScheduler()
             self.expiration_scheduler.add_job(
                 func=self.kill_expired_containers,
-                args=(app,),
                 trigger="interval",
                 seconds=EXPIRATION_CHECK_INTERVAL,
             )
@@ -113,6 +112,7 @@ class ContainerManager:
             atexit.register(lambda: self.expiration_scheduler.shutdown())
 
     # TODO: Fix this cause it doesn't work
+    @staticmethod
     def run_command(func):
         def wrapper_run_command(self, *args, **kwargs):
             if self.client is None:
@@ -142,8 +142,8 @@ class ContainerManager:
         return wrapper_run_command
 
     @run_command
-    def kill_expired_containers(self, app: Flask):
-        with app.app_context():
+    def kill_expired_containers(self):
+        with self.app.app_context():
             containers: "list[ContainerInfoModel]" = ContainerInfoModel.query.all()
 
             for container in containers:
@@ -250,6 +250,9 @@ class ContainerManager:
 
     @run_command
     def get_container_port(self, container_id: str) -> "str|None":
+        # Force a fresh fetch of all its attributes
+        self.client.containers.get(container_id).reload()
+        
         try:
             for port in list(self.client.containers.get(container_id).ports.values()):
                 if port is not None:
